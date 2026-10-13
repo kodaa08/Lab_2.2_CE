@@ -1,0 +1,226 @@
+# =====================================================================================
+#  Modelo del sobrecalentador 8 x 8 con desviadores cerámicos - Diseño A (quemador lateral)
+#  Lab 2 "Circuito de humos Planta de Vapor" - Centrales de Energía 541477, Grupo 12 (UdeC)
+#
+#  8 serpentines en paralelo de 8 pasos (tubo Ø16 x 2 mm). Paso 1 arriba (entra vapor saturado),
+#  paso 8 abajo (sale vapor sobrecalentado). Desviadores cerámicos entre los pasos 2-3 y 5-6:
+#     cámara radiante = pasos 6-8 | compartimento B = pasos 3-5 | compartimento A = pasos 1-2
+#  Gas: cámara -> B -> A -> chimenea          Vapor: A -> B -> cámara (contracorriente)
+#
+#  Cámara radiante : gas bien mezclado a su T de salida, Lobo-Evans con refractario, plano frío de
+#                    Hottel; con el quemador lateral el gas corre a lo largo de los tubos (canal, Nu = 5).
+#  Compartimentos  : canal entre placas, gas a lo largo de los tubos (Nu 5 laminar / Gnielinski),
+#                    radiación del gas + rerradiación de placas cerámicas adiabáticas; vapor a su T media.
+#  Lado vapor      : Gnielinski + fricción de Petukhov + pérdidas por codo de 180°.
+#  Verificación    : geometría fija -> se busca el rendimiento con el que el vapor llega justo
+#                    saturado seco al inicio del paso 1 (Q_comb = Q_útil / eta).
+#
+#  Usa las funciones de combustión y radiación de caldera.py (mismo directorio).
+#  Requiere: numpy, scipy, cantera, CoolProp.   Ejecutar:  python sobrecalentador.py   (~1-2 min)
+# =====================================================================================
+import os, sys
+try:                       # permite importar caldera.py aunque el programa se ejecute desde otra carpeta
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+except NameError:          # Jupyter / Colab: caldera.py debe estar en la carpeta de trabajo
+    pass
+import numpy as np
+from scipy.optimize import brentq
+from CoolProp.CoolProp import PropsSI
+from caldera import (GN, MEZ, productos, props_comb, hP, hR, T_adiabatica, props_gas, relacion_CH,
+                     radiacion_gases, fv_hollin, eps_hollin, MW_PROD, SIG, P_ATM_BAR)
+
+# ============================ 1. PARÁMETROS DE ENTRADA ============================
+M_VAP_KGH = 200.0      # kg/h de vapor (fijo, enunciado)
+P_MAN = 7.0            # bar(m), presión de la caldera
+DT_SC = 80.0           # K de sobrecalentamiento sobre Tsat
+Q_CARCASA = 0.03       # fracción de Q_comb perdida por la caja (asignada a la cámara)
+E_AIRE = 0.20          # exceso de aire
+T_AIRE_C = 25.0        # °C aire de combustión
+
+OD, ESP, K_TUBO = 0.016, 0.002, 45.0      # m, m, W/mK (P235GH)
+N_PAR, N_PASOS = 8, 8                     # serpentines en paralelo, pasos por serpentín
+L_RECTO = 0.40                            # m tramo recto por paso (diseño A)
+R_OD = 1.5                                # radio de curvado / OD (paso vertical = 2R)
+H_QUEM = 0.30                             # m quemador -> paso 8
+PROF = 0.20                               # m profundidad interior de la caja
+HOLGURA = 0.010                           # m codo -> pared lateral
+N_A, N_B = 2, 3                           # pasos en los compartimentos A y B
+E_DESV, EPS_P = 0.020, 0.9                # espesor y emisividad de los desviadores cerámicos
+NU_LAM, K_GIRO, K_CODO = 5.0, 2.0, 0.5    # Nu laminar, pérdida por giro del gas, codo lado vapor
+EPS_T = 0.8                               # emisividad de los tubos
+QUEMADOR_LATERAL = True                   # True: gas paralelo a los tubos en la cámara (Nu = 5)
+DZ, N_SEG = 0.01, 40                      # paso de integración en la cámara, tramos por compartimento
+
+# ============================ 2. GEOMETRÍA DERIVADA ============================
+ID = OD - 2 * ESP
+R_C = R_OD * OD; PASO = 2 * R_C
+L_FILA = L_RECTO + np.pi * R_C                      # recto + un codo de 180°
+L_SERP = N_PASOS * L_FILA
+A_INST = N_PAR * L_SERP * np.pi * OD
+W_CAJA = L_RECTO + 2 * (R_C + OD / 2 + HOLGURA)
+N_RAD = N_PASOS - N_A - N_B
+H_CAM = H_QUEM + N_RAD * PASO
+L_RAD = N_RAD * L_FILA; L_T = N_PAR * L_RAD
+A_TUB = L_T * np.pi * OD
+V_CAM = W_CAJA * PROF * H_CAM - L_T * np.pi / 4 * OD**2
+A_R = 2 * (W_CAJA * PROF + W_CAJA * H_CAM + PROF * H_CAM)
+L_M = 3.6 * V_CAM / (A_R + A_TUB)
+x_s = OD / (PROF / N_PAR)                                       # D_e / s
+F_d = 1 - np.sqrt(max(1 - x_s**2, 0)) + x_s * np.arctan(np.sqrt(max(1 / x_s**2 - 1, 0)))
+ALFA_CP = 1 - (1 - F_d)**(2 * N_RAD)
+A_C = min(ALFA_CP * L_FILA * PROF, A_TUB)                       # plano frío equivalente de Hottel
+F_RC = min(1.0, A_C / A_R)
+A_RAD = A_C / L_T                                               # área fría por metro de tubo
+P_VAP = (P_MAN + P_ATM_BAR) * 1e5                               # Pa
+T_SAT = PropsSI('T', 'P', P_VAP, 'Q', 1, 'Water')
+H_ENT = PropsSI('H', 'P', P_VAP, 'Q', 1, 'Water')               # J/kg (saturado seco)
+H_SAL = PropsSI('H', 'T', T_SAT + DT_SC, 'P', P_VAP, 'Water')
+M_VAP = M_VAP_KGH / 3600; M_S = M_VAP / N_PAR
+Q_UTIL = M_VAP * (H_SAL - H_ENT)                                # W
+R_W = np.log(OD / ID) / (2 * np.pi * K_TUBO)
+
+# ============================ 3. FUNCIONES ============================
+def f_petukhov(Re): return (0.790 * np.log(Re) - 1.64)**-2
+def nu_gniel(Re, Pr):
+    f = f_petukhov(Re); return (f / 8) * (Re - 1000) * Pr / (1 + 12.7 * np.sqrt(f / 8) * (Pr**(2 / 3) - 1))
+def nu_canal(Re, Pr):
+    if Re < 2300: return NU_LAM
+    if Re > 4000: return nu_gniel(Re, Pr)
+    w = (Re - 2300) / 1700; return (1 - w) * NU_LAM + w * nu_gniel(4000, Pr)
+def f_canal(Re): return 64 / Re if Re < 2300 else (0.316 * Re**-0.25 if Re < 2e4 else f_petukhov(Re))
+def nu_cb(Re, Pr):   # Churchill-Bernstein (solo si el quemador está bajo los tubos)
+    return 0.3 + 0.62 * Re**0.5 * Pr**(1 / 3) / (1 + (0.4 / Pr)**(2 / 3))**0.25 * (1 + (Re / 282000)**(5 / 8))**0.8
+def rho_gas(p, T):
+    nt = sum(p.values()); M = sum(p[s] * MW_PROD[s] for s in p) / nt
+    return P_ATM_BAR * 1e5 * M * 1e-3 / (8.314 * T)
+
+def vapor(h):
+    """Lado vapor a entalpía h [J/kg]: T, h_i, G, rho, f."""
+    T = PropsSI('T', 'H', h, 'P', P_VAP, 'Water'); Te = max(T, T_SAT + 0.05)
+    cp = PropsSI('C', 'T', Te, 'P', P_VAP, 'Water'); mu = PropsSI('V', 'T', Te, 'P', P_VAP, 'Water')
+    k = PropsSI('L', 'T', Te, 'P', P_VAP, 'Water'); rho = PropsSI('D', 'T', Te, 'P', P_VAP, 'Water')
+    G = M_S / (np.pi / 4 * ID**2); Re = G * ID / mu
+    return T, nu_gniel(Re, cp * mu / k) * k / ID, G, rho, f_petukhov(Re)
+
+def camara(p, fv, Tg, mg, h_out):
+    """Cámara radiante a T_g: marcha las filas desde la salida del vapor hacia atrás (por serpentín)."""
+    cp, mu, k = props_gas(p, Tg); rho = rho_gas(p, Tg)
+    if QUEMADOR_LATERAL:   # gas a lo largo de los tubos en el canal H_cam x PROF
+        Ag = H_CAM * PROF - N_RAD * N_PAR * np.pi / 4 * OD**2
+        Pm = 2 * (H_CAM + PROF) + N_RAD * N_PAR * np.pi * OD; Dh = 4 * Ag / Pm
+        hc = nu_canal(rho * (mg / (rho * Ag)) * Dh / mu, cp * mu / k) * k / Dh
+    else:                  # flujo cruzado sobre los tubos
+        v = mg / (rho * W_CAJA * PROF); hc = nu_cb(rho * v * OD / mu, cp * mu / k) * k / OD
+    n = max(int(np.ceil(L_RAD / DZ)), 5); dz = L_RAD / n
+    Twm = PropsSI('T', 'H', h_out, 'P', P_VAP, 'Water') + 150
+    for _ in range(2):
+        rg = radiacion_gases(p, Tg, Twm, L_M)
+        eh, ah = eps_hollin(fv, Tg, L_M), eps_hollin(fv, Twm, L_M)
+        ell = ((rg['eps_g'] + eh) * Tg**4 - (rg['alfa_g'] + ah) * Twm**4) / (Tg**4 - Twm**4)
+        ef = min(ell * (1 + (A_R / A_C) / (1 + ell / ((1 - ell) * F_RC))), 0.99)   # Lobo-Evans, ec. 11 clásica
+        Fb = 1 / (1 / ef + 1 / EPS_T - 1)
+        h = h_out; Q = Qr = Qc = dP = sdTA = sUA = 0.0; Twmax = 0.0; sTw = 0.0
+        for _ in range(n):
+            Ts, hi, G, rv, f = vapor(h); Rt = R_W + 1 / (hi * np.pi * ID)
+            def bal(Tw): return SIG * Fb * (Tg**4 - Tw**4) * A_RAD + hc * (Tg - Tw) * np.pi * OD - (Tw - Ts) / Rt
+            Tw = brentq(bal, Ts, Tg)
+            qr = SIG * Fb * (Tg**4 - Tw**4) * A_RAD; qc = hc * (Tg - Tw) * np.pi * OD; q = qr + qc
+            Q += q * dz; Qr += qr * dz; Qc += qc * dz; sdTA += np.pi * OD * dz * (Tg - Tw); sUA += q * dz / (Tg - Ts)
+            h -= q * dz / M_S; dP += f * dz / ID * G**2 / (2 * rv); Twmax = max(Twmax, Tw); sTw += Tw
+        Twm = sTw / n
+    dP += N_RAD * K_CODO * G**2 / (2 * rv)
+    return dict(Q=Q, Qr=Qr, Qc=Qc, h_ent=h, Twmax=Twmax, Twm=Twm, dP=dP, hc=hc, eps_g=rg['eps_g'], eps_h=eh,
+                eps_ll=ell, eps_f=ef, sdTA=sdTA, sUA=sUA)
+
+def camara_T(p, fv, n_f, h0, Qcar, mg, Tlo, Thi):
+    """T de gases a la salida de la cámara: n_f (h_R - h_P(Tg)) = N_par Q_tubos + Q_caja."""
+    res = lambda Tg: n_f * (h0 - hP(p, Tg)) * 1e6 - (N_PAR * camara(p, fv, Tg, mg, H_SAL)['Q'] + Qcar)
+    Tg = brentq(res, Tlo, Thi, xtol=0.05)
+    return Tg, camara(p, fv, Tg, mg, H_SAL)
+
+def placa(Tg, Tw, hc, eg, Ap, Atv, Fpt):
+    """Placa cerámica adiabática: convección + radiación del gas = rerradiación hacia los tubos."""
+    return brentq(lambda Tp: hc * Ap * (Tg - Tp) + SIG * eg * EPS_P * Ap * (Tg**4 - Tp**4)
+                  - SIG * Fpt * Atv * (Tp**4 - Tw**4), Tw, Tg)
+
+def compartimento(p, Tg0, nfil, h_out, mg):
+    """Compartimento entre desviadores (gas a lo largo de los tubos, vapor a su T media)."""
+    nt = sum(p.values()); pc = p['CO2'] / nt * P_ATM_BAR; pw = p['H2O'] / nt * P_ATM_BAR
+    Hc = nfil * PASO - E_DESV
+    Ag = Hc * PROF - nfil * N_PAR * np.pi / 4 * OD**2
+    Pm = 2 * (Hc + PROF) + nfil * N_PAR * np.pi * OD; Dh = 4 * Ag / Pm
+    Ap = 2 * (Hc + PROF); At = nfil * N_PAR * np.pi * OD
+    Atv = min(At, 2 * N_PAR * OD + 2 * nfil * OD)
+    Fpt = 1 / (1 / EPS_T + (Atv / Ap) * (1 / EPS_P - 1))
+    Lm = 3.6 * Ag / Pm; ntub = nfil * N_PAR; dz = L_FILA / N_SEG
+    h_in = h_out - 1e3
+    for _ in range(4):
+        Ts, hi, G, rv, f = vapor(0.5 * (h_in + h_out)); Rt = R_W + 1 / (hi * np.pi * ID)
+        Tg = Tg0; Tw = Ts + 30; Q = Qc = Qg = Qp = sdTA = sUA = dPg = 0.0; Twmax = 0.0
+        for _ in range(N_SEG):
+            cp, mu, k = props_gas(p, Tg); rho = rho_gas(p, Tg); v = mg / (rho * Ag); Re = rho * v * Dh / mu
+            hc = nu_canal(Re, cp * mu / k) * k / Dh
+            rg = radiacion_gases(p, Tg, Tw, Lm); eg, ag = rg['eps_g'], rg['alfa_g']
+            def q_all(Tw_):
+                Tp = placa(Tg, Tw_, hc, eg, Ap, Atv, Fpt)
+                qc = hc * (Tg - Tw_) * At; qg = SIG * (eg * Tg**4 - ag * Tw_**4) * EPS_T * At
+                qp = SIG * Fpt * Atv * (Tp**4 - Tw_**4); return qc, qg, qp
+            Tw = brentq(lambda T: sum(q_all(T)) / ntub - (T - Ts) / Rt, Ts, Tg - 1e-6)
+            qc, qg, qp = q_all(Tw); q = qc + qg + qp
+            Q += q * dz; Qc += qc * dz; Qg += qg * dz; Qp += qp * dz
+            sdTA += At * dz * (Tg - Tw); sUA += q * dz / (Tg - Ts); Twmax = max(Twmax, Tw)
+            dPg += f_canal(Re) * dz / Dh * rho * v**2 / 2
+            Tg -= q * dz / (mg * cp)
+        h_in = h_out - Q / M_VAP
+    Tmed = 0.5 * (Tg0 + Tg); vm = mg / (rho_gas(p, Tmed) * Ag)
+    dPg += K_GIRO * rho_gas(p, Tmed) * vm**2 / 2
+    dPv = f * nfil * L_FILA / ID * G**2 / (2 * rv) + nfil * K_CODO * G**2 / (2 * rv)
+    return dict(Q=Q, Tg=Tg, h_in=h_in, Twmax=Twmax, dPg=dPg, dPv=dPv, Re=Re, hc=hc, v=vm,
+                Qc=Qc, Qg=Qg, Qp=Qp, sdTA=sdTA, sUA=sUA)
+
+def estado(f, eta):
+    """Calcula todo el equipo para un rendimiento dado."""
+    lam = 1 + E_AIRE; p = productos(f, lam); fp = props_comb(f); Tair = T_AIRE_C + 273.15
+    Qcomb = Q_UTIL / eta; Qcar = Q_CARCASA * Qcomb
+    n_f = Qcomb / (fp['PCI_mol'] * 1e6)                                # kmol/s (PCI en MJ/kmol)
+    mg = n_f * sum(p[s] * MW_PROD[s] for s in p)                       # kg/s
+    h0 = hR(f, lam, Tair); Tad = T_adiabatica(f, lam, Tair)
+    fv = fv_hollin(100 * E_AIRE, relacion_CH(f))
+    Tg1, C = camara_T(p, fv, n_f, h0, Qcar, mg, T_SAT + DT_SC + 50, Tad - 1)
+    B = compartimento(p, Tg1, N_B, C['h_ent'], mg)
+    A = compartimento(p, B['Tg'], N_A, B['h_in'], mg)
+    return dict(f=f, p=p, fp=fp, eta=eta, Qcomb=Qcomb, Qcar=Qcar, n_f=n_f, mg=mg, Tad=Tad, fv=fv,
+                Tg1=Tg1, C=C, B=B, A=A, Tair=Tair)
+
+def verificar(f):
+    """Rendimiento con el que el vapor llega justo saturado seco al inicio del paso 1."""
+    return brentq(lambda eta: estado(f, eta)['A']['h_in'] - H_ENT, 0.70, 0.895, xtol=1e-4)
+
+# ============================ 4. EJECUCIÓN ============================
+if __name__ == '__main__':
+    print(f"Geometría: caja {1e3*W_CAJA:.0f} x {1e3*PROF:.0f} mm, cámara alto {1e3*H_CAM:.0f} mm | "
+          f"L_serp {L_SERP:.3f} m | área {A_INST:.3f} m² | A_tub cámara {A_TUB:.3f} m² | A_c {A_C:.3f} m² | L_m {L_M:.3f} m")
+    print(f"Q_útil = {Q_UTIL/1e3:.2f} kW (vapor {T_SAT-273.15:.1f} -> {T_SAT-273.15+DT_SC:.1f} °C, {M_VAP_KGH:.0f} kg/h)")
+    for nombre, f in (('Gas natural', GN), ('Mezcla 10 % H2', MEZ)):
+        eta = verificar(f); R = estado(f, eta); C, B, A = R['C'], R['B'], R['A']
+        PCI_kg = R['fp']['PCI_mol'] / R['fp']['M'] * 1e3
+        mc = R['Qcomb'] / 1e3 / PCI_kg * 3600
+        RAC = (1 + E_AIRE) * R['fp']['aire_est'] * 28.85 / R['fp']['M']
+        Qcam = N_PAR * C['Q'] / 1e3
+        Tv = lambda h: PropsSI('T', 'H', h, 'P', P_VAP, 'Water') - 273.15
+        Qhumos_cam = R['n_f'] * (hP(R['p'], R['Tg1']) - hP(R['p'], R['Tair'])) * 1e3
+        UA = N_PAR * C['sUA'] + B['sUA'] + A['sUA']
+        dTA = N_PAR * C['sdTA'] + B['sdTA'] + A['sdTA']
+        Qconv = N_PAR * C['Qc'] + B['Qc'] + A['Qc']; Qrad = N_PAR * C['Qr'] + B['Qg'] + B['Qp'] + A['Qg'] + A['Qp']
+        print(f"\n=== {nombre} (e = {100*E_AIRE:.0f} %) ===")
+        print(f"eta = {100*eta:.2f} % | Q_comb = {R['Qcomb']/1e3:.2f} kW | m_comb = {mc:.3f} kg/h | m_aire = {RAC*mc:.2f} kg/h")
+        print(f"T gas [°C]: llama {R['Tad']-273.15:.0f} | salida cámara {R['Tg1']-273.15:.0f} | salida B {B['Tg']-273.15:.0f} | chimenea {A['Tg']-273.15:.1f}")
+        print(f"Q [kW]: cámara {Qcam:.2f} (rad {N_PAR*C['Qr']/1e3:.2f} + conv {N_PAR*C['Qc']/1e3:.2f}) | B {B['Q']/1e3:.2f} | A {A['Q']/1e3:.2f} | caja {R['Qcar']/1e3:.2f}")
+        print(f"Cámara: Q_humos {Qhumos_cam:.2f} kW | eps_g {C['eps_g']:.3f} | eps_h {C['eps_h']:.3f} | eps_f {C['eps_f']:.3f} | "
+              f"h_c {C['hc']:.2f} W/m²K | T_sup {C['Twm']:.0f} K")
+        print(f"Vapor [°C]: {Tv(H_ENT):.1f} -> {Tv(B['h_in']):.1f} (sale A) -> {Tv(C['h_ent']):.1f} (sale B) -> {Tv(H_SAL):.1f}")
+        print(f"T pared máx {max(C['Twmax'], B['Twmax'], A['Twmax'])-273.15:.0f} °C | dP vapor {(C['dP']+B['dPv']+A['dPv'])/1e3:.2f} kPa | "
+              f"dP gas {B['dPg']+A['dPg']:.2f} Pa")
+        print(f"Compartimentos: Re {B['Re']:.0f} / {A['Re']:.0f} | h_c {B['hc']:.2f} / {A['hc']:.2f} W/m²K | v gas {B['v']:.2f} / {A['v']:.2f} m/s")
+        print(f"Coef. efectivos: h_conv,h {Qconv/dTA:.2f} W/m²K | h_rad,h {Qrad/dTA:.2f} W/m²K | "
+              f"Q_conv {Qconv/1e3:.2f} kW | Q_rad {Qrad/1e3:.2f} kW | UA {UA:.2f} W/K")
